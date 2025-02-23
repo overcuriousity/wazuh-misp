@@ -1,0 +1,240 @@
+#!/var/ossec/framework/python/bin/python3
+import sys
+import os
+from socket import socket, AF_UNIX, SOCK_DGRAM
+import json
+import ipaddress
+import requests
+from requests.exceptions import ConnectionError
+
+# Setup socket path for Wazuh
+pwd = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+socket_addr = '{0}/queue/sockets/queue'.format(pwd)
+
+def send_event(msg, agent=None):
+    """Send event to Wazuh manager"""
+    if not agent or agent['id'] == '000':
+        string = '1:misp:{0}'.format(json.dumps(msg))
+    else:
+        string = '1:[{0}] ({1}) {2}->misp:{3}'.format(
+            agent['id'],
+            agent['name'],
+            agent['ip'] if 'ip' in agent else 'any',
+            json.dumps(msg)
+        )
+    sock = socket(AF_UNIX, SOCK_DGRAM)
+    sock.connect(socket_addr)
+    sock.send(string.encode())
+    sock.close()
+
+def check_misp_for_ioc(value, misp_base_url, misp_api_auth_key):
+    """Query MISP for an IoC value"""
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': misp_api_auth_key,
+        'Accept': 'application/json'
+    }
+    
+    search_value = f"value:{value}"
+    search_url = f"{misp_base_url}/attributes/restSearch/{search_value}"
+    
+    try:
+        response = requests.get(search_url, headers=headers, verify=False)
+        return response.json()
+    except ConnectionError:
+        return None
+
+def extract_authentication_iocs(alert):
+    """Extract indicators from authentication events"""
+    iocs = []
+    if 'data' in alert:
+        # Extract usernames from authentication events
+        if 'srcuser' in alert['data']:
+            iocs.append({
+                'type': 'username',
+                'value': alert['data']['srcuser']
+            })
+        # Extract source IPs from authentication attempts
+        if 'srcip' in alert['data']:
+            try:
+                ip = alert['data']['srcip']
+                if ipaddress.ip_address(ip).is_global:
+                    iocs.append({
+                        'type': 'ip',
+                        'value': ip
+                    })
+            except ValueError:
+                pass
+    return iocs
+
+def extract_clamd_iocs(alert):
+    """Extract indicators from ClamAV alerts"""
+    iocs = []
+    if 'data' in alert:
+        # Extract virus signatures
+        if 'virustotal' in alert['data']:
+            iocs.append({
+                'type': 'malware',
+                'value': alert['data']['virustotal']
+            })
+        # Extract file paths and hashes if available
+        if 'filepath' in alert['data']:
+            iocs.append({
+                'type': 'filename',
+                'value': os.path.basename(alert['data']['filepath'])
+            })
+    return iocs
+
+def extract_file_hashes(syscheck):
+    """Extract file hashes from syscheck events"""
+    hashes = []
+    
+    if 'sha256_after' in syscheck:
+        hashes.append({
+            'type': 'sha256',
+            'value': syscheck['sha256_after']
+        })
+    
+    if 'sha1_after' in syscheck:
+        hashes.append({
+            'type': 'sha1',
+            'value': syscheck['sha1_after']
+        })
+    
+    if 'md5_after' in syscheck:
+        hashes.append({
+            'type': 'md5',
+            'value': syscheck['md5_after']
+        })
+    
+    return hashes
+
+def extract_dns_queries(data):
+    """Extract domain names from DNS queries"""
+    domains = []
+    if 'dns' in data and 'query' in data['dns']:
+        for query in data['dns']['query']:
+            if 'rrname' in query:
+                domains.append({
+                    'type': 'domain',
+                    'value': query['rrname'].lower()
+                })
+    return domains
+
+def extract_rootcheck_iocs(alert):
+    """Extract indicators from rootcheck events"""
+    iocs = []
+    if 'data' in alert:
+        # Extract suspicious file paths
+        if 'file' in alert['data']:
+            iocs.append({
+                'type': 'filename',
+                'value': os.path.basename(alert['data']['file'])
+            })
+        # Extract suspicious processes
+        if 'process' in alert['data']:
+            iocs.append({
+                'type': 'process',
+                'value': alert['data']['process']
+            })
+    return iocs
+
+def extract_ioc_from_alert(alert):
+    """Extract potential IoCs from different alert types"""
+    iocs = []
+    
+    # Handle syscheck events (File Integrity Monitoring)
+    if 'syscheck' in alert:
+        iocs.extend(extract_file_hashes(alert['syscheck']))
+    
+    # Handle authentication events
+    if any(group in alert['rule']['groups'] for group in ['authentication_success', 'authentication_failed']):
+        iocs.extend(extract_authentication_iocs(alert))
+    
+    # Handle ClamAV alerts
+    if 'clamd' in alert['rule']['groups'] or 'virus' in alert['rule']['groups']:
+        iocs.extend(extract_clamd_iocs(alert))
+    
+    # Handle rootcheck alerts
+    if 'rootcheck' in alert['rule']['groups']:
+        iocs.extend(extract_rootcheck_iocs(alert))
+    
+    # Handle Suricata/IDS alerts
+    if 'data' in alert and ('ids' in alert['rule']['groups'] or 'suricata' in alert['rule']['groups']):
+        # Extract DNS queries
+        if alert['data'].get('app_proto') == 'dns':
+            iocs.extend(extract_dns_queries(alert['data']))
+        
+        # Extract IPs
+        for ip_field in ['src_ip', 'dest_ip']:
+            if ip_field in alert['data']:
+                try:
+                    ip = alert['data'][ip_field]
+                    if ipaddress.ip_address(ip).is_global:
+                        iocs.append({
+                            'type': 'ip',
+                            'value': ip
+                        })
+                except ValueError:
+                    pass
+        
+        # Extract URLs and user agents
+        if 'http' in alert['data']:
+            if 'url' in alert['data']['http']:
+                iocs.append({
+                    'type': 'url',
+                    'value': alert['data']['http']['url']
+                })
+            if 'http_user_agent' in alert['data']['http']:
+                iocs.append({
+                    'type': 'user-agent',
+                    'value': alert['data']['http']['http_user_agent']
+                })
+    
+    return iocs if iocs else None
+
+def main():
+    # Configuration
+    misp_base_url = 'https://misp.misp.tld'  # Configure your MISP instance
+    misp_api_auth_key = '' 
+    
+    # Read alert file
+    with open(sys.argv[1]) as alert_file:
+        alert = json.loads(alert_file.read())
+    
+    # Initialize alert output
+    alert_output = {'integration': 'misp'}
+    
+    # Extract IoCs from alert
+    iocs = extract_ioc_from_alert(alert)
+    if not iocs:
+        sys.exit(0)
+    
+    # Query MISP for each IoC
+    for ioc in iocs:
+        misp_response = check_misp_for_ioc(ioc['value'], misp_base_url, misp_api_auth_key)
+        
+        if misp_response is None:
+            alert_output['misp'] = {'error': 'Connection Error to MISP API'}
+            send_event(alert_output, alert.get('agent'))
+            continue
+            
+        # Process MISP response
+        if misp_response['response'].get('Attribute'):
+            attribute = misp_response['response']['Attribute'][0]
+            alert_output['misp'] = {
+                'event_id': attribute['event_id'],
+                'category': attribute['category'],
+                'value': attribute['value'],
+                'type': attribute['type'],
+                'source': {
+                    'type': ioc['type'],
+                    'description': alert['rule']['description'],
+                    'path': alert.get('syscheck', {}).get('path', ''),
+                    'alert_signature': alert.get('data', {}).get('alert', {}).get('signature', '')
+                }
+            }
+            send_event(alert_output, alert.get('agent'))
+
+if __name__ == '__main__':
+    main()
