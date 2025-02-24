@@ -1,0 +1,279 @@
+#!/usr/bin/python3
+import sys
+import json
+from datetime import datetime, timedelta
+import sqlite3
+import threading
+
+MISP_URL = ''
+MISP_APIKEY = ''
+HONEYPOT_AGENT_IDENTIFIER_STARTSWITH = 'honeypot-'
+
+TEST_ALERT = {
+    "rule": {
+        "id": "5503",
+        "groups": ["authentication_failed"],
+        "mitre": {"technique": [], "tactic": []}
+    },
+    "agent": {"name": "honeypot-test"},
+    "data": {"srcip": "192.168.1.100"},
+    "GeoLocation": {}
+}
+
+
+def write_debug_file(msg, level="INFO"):
+    """Write debug information to file with log level"""
+    with open('/var/ossec/logs/integrations.log', 'a') as f:
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - [Publish-Debug] [{level}] {msg}\n")
+
+
+try:
+    from pymisp import PyMISP, MISPEvent, MISPObject
+    write_debug_file("PyMISP imported successfully")
+except Exception as e:
+    write_debug_file(f"Failed to import PyMISP: {str(e)}", "ERROR")
+    sys.exit(1)
+
+
+def read_alert_file(filepath):
+    """Read and validate alert file"""
+    try:
+        write_debug_file(f"Attempting to read file: {filepath}")
+        with open(filepath, 'r') as f:
+            content = f.read().strip()
+            # Sometimes Wazuh sends an empty file, check for this
+            if not content:
+                write_debug_file("Empty file received", "ERROR")
+                return None
+                
+            write_debug_file(f"File content (first 50 chars): {content[:50]}")
+            return json.loads(content)
+    except FileNotFoundError:
+        write_debug_file(f"File not found: {filepath}", "ERROR")
+        return None
+    except json.JSONDecodeError as e:
+        write_debug_file(f"JSON decode error: {str(e)}", "ERROR")
+        return None
+    except Exception as e:
+        write_debug_file(f"Unexpected error reading file: {str(e)}", "ERROR")
+        return None
+
+def init_db():
+    db_path = '/tmp/misp_buffer.db'
+    write_debug_file(f"Initializing database at {db_path}")
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS pending_events
+                 (srcip TEXT PRIMARY KEY, 
+                  first_seen TEXT,
+                  last_seen TEXT,
+                  attempt_count INTEGER,
+                  usernames TEXT,
+                  geo_data TEXT,
+                  mitre_techniques TEXT,
+                  mitre_tactics TEXT)''')
+    conn.commit()
+    return conn
+
+def extract_username(alert_data):
+    """Extract username from various possible fields"""
+    data = alert_data.get('data', {})
+    if 'srcuser' in data:
+        return data['srcuser']
+    elif 'dstuser' in data:
+        return data['dstuser']
+    return None
+
+def update_pending_event(conn, alert_data):
+    """Update or insert a pending event in the database"""
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    srcip = alert_data['data']['srcip']
+    username = extract_username(alert_data)
+    
+    # Extract MITRE data
+    mitre_data = alert_data.get('rule', {}).get('mitre', {})
+    techniques = mitre_data.get('technique', [])
+    tactics = mitre_data.get('tactic', [])
+    
+    # Extract GeoLocation data
+    geo_data = alert_data.get('GeoLocation', {})
+    
+    # Try to update existing record
+    c.execute('''SELECT usernames, attempt_count, mitre_techniques, mitre_tactics 
+                 FROM pending_events WHERE srcip = ?''', (srcip,))
+    result = c.fetchone()
+    
+    if result:
+        # Update existing record
+        current_usernames = set(json.loads(result[0]))
+        if username:
+            current_usernames.add(username)
+        
+        # Merge MITRE data
+        current_techniques = set(json.loads(result[2]))
+        current_tactics = set(json.loads(result[3]))
+        current_techniques.update(techniques)
+        current_tactics.update(tactics)
+        
+        c.execute('''UPDATE pending_events 
+                    SET last_seen = ?,
+                        attempt_count = attempt_count + 1,
+                        usernames = ?,
+                        mitre_techniques = ?,
+                        mitre_tactics = ?
+                    WHERE srcip = ?''',
+                 (now, 
+                  json.dumps(list(current_usernames)),
+                  json.dumps(list(current_techniques)),
+                  json.dumps(list(current_tactics)),
+                  srcip))
+    else:
+        # Insert new record
+        c.execute('''INSERT INTO pending_events 
+                    (srcip, first_seen, last_seen, attempt_count, usernames, 
+                     geo_data, mitre_techniques, mitre_tactics)
+                    VALUES (?, ?, ?, 1, ?, ?, ?, ?)''',
+                 (srcip, now, now, 
+                  json.dumps([username] if username else []),
+                  json.dumps(geo_data),
+                  json.dumps(techniques),
+                  json.dumps(tactics)))
+    
+    conn.commit()
+
+def publish_pending_events(misp_url, misp_key):
+    """Check for events that are ready to publish and create MISP events"""
+    conn = init_db()
+    c = conn.cursor()
+    threshold_time = (datetime.now() - timedelta(minutes=15)).isoformat()
+    
+    # Get events older than threshold
+    c.execute('''SELECT * FROM pending_events WHERE last_seen < ?''', (threshold_time,))
+    pending_events = c.fetchall()
+    
+    if not pending_events:
+        write_debug_file("No pending events ready for publishing")
+        return
+
+    try:
+        misp = PyMISP(misp_url, misp_key, ssl=False)
+        
+        for event in pending_events:
+            srcip, first_seen, last_seen, attempt_count, usernames, geo_data, techniques, tactics = event
+            usernames = json.loads(usernames)
+            geo_data = json.loads(geo_data)
+            techniques = json.loads(techniques)
+            tactics = json.loads(tactics)
+            
+            misp_event = MISPEvent()
+            misp_event.info = f"SSH Brute Force Attack from {srcip} ({attempt_count} attempts)"
+            misp_event.distribution = 2
+            misp_event.threat_level_id = 2
+            misp_event.analysis = 2
+            
+            # Add core attributes
+            misp_event.add_attribute('ip-src', srcip, 
+                                   category='Network activity',
+                                   to_ids=True)
+            
+            # Add timestamps
+            misp_event.add_attribute('datetime', first_seen,
+                                   category='Other',
+                                   comment='First attempt')
+            
+            misp_event.add_attribute('datetime', last_seen,
+                                   category='Other',
+                                   comment='Last attempt')
+            
+            # Add count
+            misp_event.add_attribute('counter', str(attempt_count),
+                                   category='Other',
+                                   comment='Number of attempts')
+            
+            # Add usernames
+            if usernames:
+                misp_event.add_attribute('text', json.dumps(usernames),
+                                       category='Payload delivery',
+                                       comment='Attempted usernames')
+            
+            # Add GeoLocation data if available
+            if geo_data.get('country_name'):
+                misp_event.add_attribute('text', 
+                                       f"Country: {geo_data.get('country_name')}\n" +
+                                       f"Region: {geo_data.get('region_name', 'N/A')}\n" +
+                                       f"City: {geo_data.get('city_name', 'N/A')}",
+                                       category='Attribution',
+                                       comment='GeoLocation')
+                
+                if 'location' in geo_data:
+                    misp_event.add_attribute('latitude', 
+                                           str(geo_data['location']['lat']),
+                                           category='Attribution')
+                    misp_event.add_attribute('longitude', 
+                                           str(geo_data['location']['lon']),
+                                           category='Attribution')
+            
+            # Add MITRE tags
+            for technique in techniques:
+                misp_event.add_tag(f'misp-galaxy:mitre-attack-pattern="{technique}"')
+            
+            for tactic in tactics:
+                misp_event.add_tag(f'misp-galaxy:mitre-attack-tactic="{tactic}"')
+            
+            write_debug_file(f"Publishing aggregated event for {srcip}")
+            result = misp.add_event(misp_event, pythonify=True)
+            write_debug_file(f"MISP add_event result: {result}")
+            
+            # Delete published event from database
+            c.execute('DELETE FROM pending_events WHERE srcip = ?', (srcip,))
+            conn.commit()
+            
+    except Exception as e:
+        write_debug_file(f"Error publishing events: {str(e)}", "ERROR")
+        return
+
+def main():
+    write_debug_file("Main function started")
+    
+    misp_url = MISP_URL
+    misp_key = MISP_APIKEY
+    honeypot_agent_startswith = HONEYPOT_AGENT_IDENTIFIER_STARTSWITH
+
+    # Initialize database
+    conn = init_db()
+
+    # Check if we're in test mode
+    if len(sys.argv) == 2 and sys.argv[1] == "--test":
+        write_debug_file("Running in test mode with sample data")
+        alert_data = TEST_ALERT
+    else:
+        if len(sys.argv) < 2:
+            write_debug_file("No input file specified", "ERROR")
+            sys.exit(1)
+
+        alert_data = read_alert_file(sys.argv[1])
+        if not alert_data:
+            write_debug_file("Failed to read alert data", "ERROR")
+            sys.exit(1)
+
+    # Check if this is a honeypot SSH attack
+    if (alert_data['rule']['id'] in ['5503', '5710', '2502'] and
+        'authentication_failed' in alert_data['rule']['groups'] and
+        alert_data['agent']['name'].startswith(honeypot_agent_startswith)):
+        
+        write_debug_file("Alert matches criteria - updating pending events")
+        update_pending_event(conn, alert_data)
+        
+        # Start publisher in a separate thread to avoid blocking
+        threading.Thread(target=publish_pending_events, 
+                       args=(misp_url, misp_key)).start()
+    else:
+        write_debug_file("Alert does not match criteria for MISP event")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        write_debug_file(f"Unhandled exception: {str(e)}", "ERROR")
+        sys.exit(1)
