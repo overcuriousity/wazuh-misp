@@ -8,6 +8,7 @@ import threading
 MISP_URL = ''
 MISP_APIKEY = ''
 HONEYPOT_AGENT_IDENTIFIER_STARTSWITH = 'honeypot-'
+PUBLISH_EVERY_MINUTES = 15
 
 TEST_ALERT = {
     "rule": {
@@ -146,7 +147,7 @@ def publish_pending_events(misp_url, misp_key):
     """Check for events that are ready to publish and create MISP events"""
     conn = init_db()
     c = conn.cursor()
-    threshold_time = (datetime.now() - timedelta(minutes=15)).isoformat()
+    threshold_time = (datetime.now() - timedelta(minutes=PUBLISH_EVERY_MINUTES)).isoformat()
     
     # Get events older than threshold
     c.execute('''SELECT * FROM pending_events WHERE last_seen < ?''', (threshold_time,))
