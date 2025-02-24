@@ -168,7 +168,6 @@ def publish_pending_events(misp_url, misp_key):
             tactics = json.loads(tactics)
             
             misp_event = MISPEvent()
-            misp_obj_attribute = MISPObjectAttribute()
             misp_event.info = f"SSH Brute Force Attack from {srcip} ({attempt_count} attempts)"
             misp_event.distribution = 2
             misp_event.threat_level_id = 2
